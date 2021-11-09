@@ -237,11 +237,6 @@ Drop to parent::
 
 The color of the indicator matches the +client.focused+ setting. See <<client_colors>>.
 
-The whole behaviour can be disabled in the config file by using:
-----------------------
-tiling_drag no
-----------------------
-
 [[tree]]
 == Tree
 

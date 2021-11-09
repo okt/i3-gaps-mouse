@@ -216,7 +216,7 @@ static void route_click(Con *con, xcb_button_press_event_t *event, const bool mo
     }
 
     /* 2: floating modifier pressed, initiate a drag */
-    if (!config.disable_tiling_drag && mod_pressed && event->detail == XCB_BUTTON_INDEX_1 && !floatingcon) {
+    if (mod_pressed && event->detail == XCB_BUTTON_INDEX_1 && !floatingcon) {
         tiling_drag(con, event);
         goto done;
     }
@@ -289,7 +289,7 @@ static void route_click(Con *con, xcb_button_press_event_t *event, const bool mo
     }
 
     /* 8: floating modifier pressed, initiate a drag */
-    if (!config.disable_tiling_drag && (mod_pressed || dest == CLICK_DECORATION) && event->detail == XCB_BUTTON_INDEX_1) {
+    if ((mod_pressed || dest == CLICK_DECORATION) && event->detail == XCB_BUTTON_INDEX_1) {
         tiling_drag(con, event);
         goto done;
     }
