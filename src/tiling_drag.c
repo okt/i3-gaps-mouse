@@ -317,7 +317,18 @@ void tiling_drag(Con *con, xcb_button_press_event_t *event) {
 
             ipc_send_window_event("move", con);
             break;
-        case DT_PARENT:
+        case DT_PARENT:;
+            const bool parent_tabbed_or_stacked = (target->parent->layout == L_TABBED || target->parent->layout == L_STACKED);
+            if (parent_tabbed_or_stacked) {
+                /* When dealing with tabbed/stacked the target can be in the
+                 * middle of the container. Thus, after a directional move, con
+                 * will still be bound to the tabbed/stacked parent. */
+                if (position == BEFORE) {
+                    target = TAILQ_FIRST(&(target->parent->nodes_head));
+                } else {
+                    target = TAILQ_LAST(&(target->parent->nodes_head), nodes_head);
+                }
+            }
             if (con != target) {
                 insert_con_into(con, target, position);
             }
