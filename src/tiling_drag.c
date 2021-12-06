@@ -348,10 +348,12 @@ void tiling_drag(Con *con, xcb_button_press_event_t *event) {
             }
             break;
     }
+    /* Warning: target might not exist anymore */
+    target = NULL;
 
     /* Manage fullscreen status. */
     if (set_focus || set_fs) {
-        Con *fs = con_get_fullscreen_covering_ws(con_get_workspace(target));
+        Con *fs = con_get_fullscreen_covering_ws(con_get_workspace(con));
         if (fs == con) {
             ELOG("dragged container somehow got fullscreen again.\n");
             assert(false);
