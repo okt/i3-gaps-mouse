@@ -288,6 +288,7 @@ void tiling_drag(Con *con, xcb_button_press_event_t *event) {
         target == NULL ||
         (target == con && drop_type != DT_PARENT) ||
         !con_exists(target)) {
+        DLOG("drop aborted\n");
         return;
     }
 
@@ -298,9 +299,11 @@ void tiling_drag(Con *con, xcb_button_press_event_t *event) {
     switch (drop_type) {
         case DT_CENTER:
             /* Also handles workspaces.*/
+            DLOG("drop to center of %p\n", target);
             con_move_to_target(con, target);
             break;
         case DT_SIBLING:
+            DLOG("drop %s %p\n", position_to_string(position), target);
             if (con_orientation(target->parent) != orientation) {
                 /* If con and target are the only children of the same parent, we can just change
                  * the parent's layout manually and then move con to the correct position.
@@ -319,6 +322,11 @@ void tiling_drag(Con *con, xcb_button_press_event_t *event) {
             break;
         case DT_PARENT:;
             const bool parent_tabbed_or_stacked = (target->parent->layout == L_TABBED || target->parent->layout == L_STACKED);
+            DLOG("drop %s (%s) of %s%p\n",
+                 direction_to_string(direction),
+                 position_to_string(position),
+                 parent_tabbed_or_stacked ? "tabbed/stacked " : "",
+                 target);
             if (parent_tabbed_or_stacked) {
                 /* When dealing with tabbed/stacked the target can be in the
                  * middle of the container. Thus, after a directional move, con
