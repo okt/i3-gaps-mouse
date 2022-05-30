@@ -1,0 +1,1526 @@
+From b59875dcc9622ed2792ef19640371bd0a2932a3c Mon Sep 17 00:00:00 2001
+From: Orestis Floros <orestisflo@gmail.com>
+Date: Mon, 14 Oct 2019 11:24:37 +0300
+Subject: [PATCH 1/5] Allow dragging tiled windows with the mouse.
+
+Fixes #2643
+
+Inner drop region behaves like move to mark.
+The outer region is close to the edge (currently 30px from the edge).
+This will place the container as a sibling in the given direction within
+the parent container. If the move direction goes against the orientation
+of the parent container, tree_move() is called.
+
+Contributors:
+Co-authored-by: Orestis Floros <orestisflo@gmail.com>
+See #3085
+- Inner drop region behaves like move to mark
+- Handle workspaces
+- Fix crash when target closes
+- Initiate tiling drag from titlebar
+- Hide indicator until container is dragged outside of original position
+- Calculate outer_threshold using percentages instead of fixed pixel
+values
+- Add option to disable tiling drag
+- Emit 'move' event properly
+- Don't focus previously unfocused containers
+- Use tree_split() on different orientation
+- Fix redundant split containers
+- DT_PARENT
+- Readability & optimizations
+- Limit parent threshold by render_deco_height()
+- Tests
+- Fullscreen container handling
+- Initiate drag from title bar
+- Fix issue of EnterNotify events still triggering after drag_callback
+  is called
+- Include decorations for drop target calculation
+
+Co-authored-by: Michael Forster <email@michael-forster.de>
+See #2178
+- Original implementation of tiling drag + indicator window
+> A container can be dragged by the title bar to one of the four sides
+> of another container. That container will then be split either
+> horizontally or vertically.
+
+Co-authored-by: Tony Crisci <tony@dubstepdish.com>
+See #2653
+- Original implementation of outer/inner drop region indicator:
+> There are two drop regions per direction.
+>
+> The inner region is closer to the center of the window. Dropping on
+> this region will split the target container and put the container
+> within the split at the given direction beside the target container.
+>
+> The outer region is close to the edge (currently 30px from the edge).
+> This will place the container as a sibling in the given direction within
+> the parent container.
+>
+> Dropping into the outer region moves the con beside the target. If the
+> move direction goes against the orientation of the parent container, the
+> con moves out of the row.
+- Fix crash: Ignore containers without a managed window (eg i3bar)
+---
+ docs/userguide                      |  50 ++++
+ include/all.h                       |   1 +
+ include/con.h                       |   1 +
+ include/config_directives.h         |   1 +
+ include/configuration.h             |   6 +
+ include/tiling_drag.h               |  16 ++
+ meson.build                         |   1 +
+ parser-specs/config.spec            |   6 +
+ release-notes/changes/3-tiling-drag |   1 +
+ src/click.c                         |  32 ++-
+ src/con.c                           |  26 +-
+ src/config_directives.c             |   4 +
+ src/tiling_drag.c                   | 358 ++++++++++++++++++++++++++++
+ src/workspace.c                     |   4 +-
+ testcases/t/201-config-parser.t     |   1 +
+ testcases/t/316-drag-container.t    | 350 +++++++++++++++++++++++++++
+ 16 files changed, 835 insertions(+), 23 deletions(-)
+ create mode 100644 include/tiling_drag.h
+ create mode 100644 release-notes/changes/3-tiling-drag
+ create mode 100644 src/tiling_drag.c
+ create mode 100644 testcases/t/316-drag-container.t
+
+diff --git a/docs/userguide b/docs/userguide
+index d43361b63..396be2c70 100644
+--- a/docs/userguide
++++ b/docs/userguide
+@@ -196,6 +196,53 @@ provided by the i3 https://github.com/i3/i3/blob/next/etc/config.keycodes[defaul
+ 
+ Floating windows are always on top of tiling windows.
+ 
++=== Moving tiling containers with the mouse
++
++Since i3 4.21, it's possible to drag tiling containers using the mouse. The
++drag can be initiated either by dragging the window's titlebar or by pressing
++the <<floating_modifier>> and dragging the container while holding the
++left-click button.
++
++Once the drag is initiated and the cursor has left the original container, drop
++indicators are created according to the position of the cursor relatively to
++the target container. These indicators help you understand what the resulting
++<<tree>> layout is going to be after you release the mouse button.
++
++The possible drop positions are:
++
++Drop on container::
++    This happens when the mouse is relatively near the center of a container.
++    If the mouse is released, the result is exactly as if you had run the
++    +move container to mark+ command. See <<move_to_mark>>.
++Drop as sibling::
++    This happens when the mouse is relatively near the edge of a container. If
++    the mouse is released, the dragged container will become a sibling of the
++    target container, placed left/right/up/down according to the position of
++    the indicator.
++    This might or might not create a new v-split or h-split according to the
++    previous layout of the target container. For example, if the target
++    container is in an h-split and you drop the dragged container below it, the
++    new layout will have to be a v-split.
++Drop to parent::
++    This happens when the mouse is relatively near the edge of a container (but
++    even closer to the border in comparison to the sibling case above) *and* if
++    that edge is also the parent container's edge. For example, if three
++    containers are in a horizontal layout then edges where this can happen is
++    the left edge of the left container, the right edge of the right container
++    and all bottom and top edges of all three containers.
++    If the mouse is released, the container is first dropped as a sibling to
++    the target container, like in the case above, and then is moved
++    directionally like with the +move left|right|down|up+ command. See
++    <<move_direction>>.
++
++The color of the indicator matches the +client.focused+ setting. See <<client_colors>>.
++
++The whole behaviour can be disabled in the config file by using:
++----------------------
++tiling_drag no
++----------------------
++
++[[tree]]
+ == Tree
+ 
+ i3 stores all information about the X11 outputs, workspaces and layout of the
+@@ -1041,6 +1088,7 @@ workspace 5 output VGA1 LVDS1
+ workspace "2: vim" output VGA1
+ ---------------------------
+ 
++[[client_colors]]
+ === Changing colors
+ 
+ You can change all colors which i3 uses to draw the window decorations.
+@@ -2253,6 +2301,7 @@ Note that you might not have a primary output configured yet. To do so, run:
+ xrandr --output <output> --primary
+ -------------------------
+ 
++[[move_direction]]
+ === Moving containers
+ 
+ Use the +move+ command to move a container.
+@@ -2535,6 +2584,7 @@ Note that you might not have a primary output configured yet. To do so, run:
+ xrandr --output <output> --primary
+ -------------------------
+ 
++[[move_to_mark]]
+ === Moving containers/windows to marks
+ 
+ To move a container to another container with a specific mark (see <<vim_like_marks>>),
+diff --git a/include/all.h b/include/all.h
+index b9a1a7a97..5941b5e6f 100644
+--- a/include/all.h
++++ b/include/all.h
+@@ -58,6 +58,7 @@
+ #include "match.h"
+ #include "xcursor.h"
+ #include "resize.h"
++#include "tiling_drag.h"
+ #include "sighandler.h"
+ #include "move.h"
+ #include "output.h"
+diff --git a/include/con.h b/include/con.h
+index 3cea67800..b8bff0807 100644
+--- a/include/con.h
++++ b/include/con.h
+@@ -371,6 +371,7 @@ void con_move_to_output(Con *con, Output *output, bool fix_coordinates);
+  */
+ bool con_move_to_output_name(Con *con, const char *name, bool fix_coordinates);
+ 
++bool con_move_to_target(Con *con, Con *target);
+ /**
+  * Moves the given container to the given mark.
+  *
+diff --git a/include/config_directives.h b/include/config_directives.h
+index e00570979..dd1c0c53c 100644
+--- a/include/config_directives.h
++++ b/include/config_directives.h
+@@ -49,6 +49,7 @@ CFGFUN(default_orientation, const char *orientation);
+ CFGFUN(workspace_layout, const char *layout);
+ CFGFUN(workspace_back_and_forth, const char *value);
+ CFGFUN(focus_follows_mouse, const char *value);
++CFGFUN(tiling_drag, const char *value);
+ CFGFUN(mouse_warping, const char *value);
+ CFGFUN(focus_wrapping, const char *value);
+ CFGFUN(force_focus_wrapping, const char *value);
+diff --git a/include/configuration.h b/include/configuration.h
+index 843e156f9..33c05cbe1 100644
+--- a/include/configuration.h
++++ b/include/configuration.h
+@@ -124,6 +124,12 @@ struct Config {
+      * It is not planned to add any different focus models. */
+     bool disable_focus_follows_mouse;
+ 
++    /** By default, the user can use the floating modifier key and the left
++     * mouse button to move tiling containers. The user can turn this
++     * functionality off.
++     */
++    bool disable_tiling_drag;
++
+     /** By default, when switching focus to a window on a different output
+      * (e.g. focusing a window on workspace 3 on output VGA-1, coming from
+      * workspace 2 on LVDS-1), the mouse cursor is warped to the center of
+diff --git a/include/tiling_drag.h b/include/tiling_drag.h
+new file mode 100644
+index 000000000..ab002d432
+--- /dev/null
++++ b/include/tiling_drag.h
+@@ -0,0 +1,16 @@
++/*
++ * vim:ts=4:sw=4:expandtab
++ *
++ * i3 - an improved dynamic tiling window manager
++ * © 2009 Michael Stapelberg and contributors (see also: LICENSE)
++ *
++ * tiling_drag.h: Reposition tiled windows by dragging.
++ *
++ */
++#pragma once
++
++/**
++ * Initiates a mouse drag operation on a tiled window.
++ *
++ */
++void tiling_drag(Con *con, xcb_button_press_event_t *event);
+diff --git a/meson.build b/meson.build
+index df2d86e0c..5c6a6198a 100644
+--- a/meson.build
++++ b/meson.build
+@@ -409,6 +409,7 @@ i3srcs = [
+   'src/sighandler.c',
+   'src/startup.c',
+   'src/sync.c',
++  'src/tiling_drag.c',
+   'src/tree.c',
+   'src/util.c',
+   'src/version.c',
+diff --git a/parser-specs/config.spec b/parser-specs/config.spec
+index b62491ed3..23040c5fe 100644
+--- a/parser-specs/config.spec
++++ b/parser-specs/config.spec
+@@ -37,6 +37,7 @@ state INITIAL:
+   'assign'                                 -> ASSIGN
+   'no_focus'                               -> NO_FOCUS
+   'focus_follows_mouse'                    -> FOCUS_FOLLOWS_MOUSE
++  'tiling_drag'                            -> TILING_DRAG
+   'mouse_warping'                          -> MOUSE_WARPING
+   'focus_wrapping'                         -> FOCUS_WRAPPING
+   'force_focus_wrapping'                   -> FORCE_FOCUS_WRAPPING
+@@ -233,6 +234,11 @@ state FOCUS_FOLLOWS_MOUSE:
+   value = word
+       -> call cfg_focus_follows_mouse($value)
+ 
++# tiling_drag bool
++state TILING_DRAG:
++  value = word
++      -> call cfg_tiling_drag($value)
++
+ # mouse_warping warping_t
+ state MOUSE_WARPING:
+   value = 'none', 'output'
+diff --git a/release-notes/changes/3-tiling-drag b/release-notes/changes/3-tiling-drag
+new file mode 100644
+index 000000000..195fcdbcb
+--- /dev/null
++++ b/release-notes/changes/3-tiling-drag
+@@ -0,0 +1 @@
++Allow moving tiling windows with the mouse
+diff --git a/src/click.c b/src/click.c
+index 7f8dd2783..60b87e473 100644
+--- a/src/click.c
++++ b/src/click.c
+@@ -188,9 +188,6 @@ static void route_click(Con *con, xcb_button_press_event_t *event, const bool mo
+             goto done;
+     }
+ 
+-    if (ws != focused_workspace)
+-        workspace_show(ws);
+-
+     /* get the floating con */
+     Con *floatingcon = con_inside_floating(con);
+     const bool proportional = (event->state & XCB_KEY_BUT_MASK_SHIFT) == XCB_KEY_BUT_MASK_SHIFT;
+@@ -218,7 +215,13 @@ static void route_click(Con *con, xcb_button_press_event_t *event, const bool mo
+         goto done;
+     }
+ 
+-    /* 2: focus this con or one of its children. */
++    /* 2: floating modifier pressed, initiate a drag */
++    if (!config.disable_tiling_drag && mod_pressed && event->detail == XCB_BUTTON_INDEX_1 && !floatingcon) {
++        tiling_drag(con, event);
++        goto done;
++    }
++
++    /* 3: focus this con or one of its children. */
+     Con *con_to_focus = con;
+     if (in_stacked && dest == CLICK_DECORATION) {
+         /* If the container is a tab/stacked container and the click happened
+@@ -231,19 +234,22 @@ static void route_click(Con *con, xcb_button_press_event_t *event, const bool mo
+             }
+         }
+     }
++    if (ws != focused_workspace) {
++        workspace_show(ws);
++    }
+     con_activate(con_to_focus);
+ 
+-    /* 3: For floating containers, we also want to raise them on click.
++    /* 4: For floating containers, we also want to raise them on click.
+      * We will skip handling events on floating cons in fullscreen mode */
+     Con *fs = con_get_fullscreen_covering_ws(ws);
+     if (floatingcon != NULL && fs != con) {
+-        /* 4: floating_modifier plus left mouse button drags */
++        /* 5: floating_modifier plus left mouse button drags */
+         if (mod_pressed && is_left_click) {
+             floating_drag_window(floatingcon, event, false);
+             return;
+         }
+ 
+-        /*  5: resize (floating) if this was a (left or right) click on the
++        /*  6: resize (floating) if this was a (left or right) click on the
+          * left/right/bottom border, or a right click on the decoration.
+          * also try resizing (tiling) if possible */
+         if (mod_pressed && is_right_click) {
+@@ -272,7 +278,7 @@ static void route_click(Con *con, xcb_button_press_event_t *event, const bool mo
+             return;
+         }
+ 
+-        /* 6: dragging, if this was a click on a decoration (which did not lead
++        /* 7: dragging, if this was a click on a decoration (which did not lead
+          * to a resize) */
+         if (dest == CLICK_DECORATION && is_left_click) {
+             floating_drag_window(floatingcon, event, !was_focused);
+@@ -282,7 +288,13 @@ static void route_click(Con *con, xcb_button_press_event_t *event, const bool mo
+         goto done;
+     }
+ 
+-    /* 7: floating modifier pressed, initiate a resize */
++    /* 8: floating modifier pressed, initiate a drag */
++    if (!config.disable_tiling_drag && (mod_pressed || dest == CLICK_DECORATION) && event->detail == XCB_BUTTON_INDEX_1) {
++        tiling_drag(con, event);
++        goto done;
++    }
++
++    /* 9: floating modifier pressed, initiate a resize */
+     if (dest == CLICK_INSIDE && mod_pressed && is_right_click) {
+         if (floating_mod_on_tiled_client(con, event)) {
+             return;
+@@ -293,7 +305,7 @@ static void route_click(Con *con, xcb_button_press_event_t *event, const bool mo
+         xcb_flush(conn);
+         return;
+     }
+-    /* 8: otherwise, check for border/decoration clicks and resize */
++    /* 10: otherwise, check for border/decoration clicks and resize */
+     if ((dest == CLICK_BORDER || dest == CLICK_DECORATION) &&
+         is_left_or_right_click) {
+         DLOG("Trying to resize (tiling)\n");
+diff --git a/src/con.c b/src/con.c
+index d89644714..7fd85b1bc 100644
+--- a/src/con.c
++++ b/src/con.c
+@@ -1391,17 +1391,7 @@ static bool _con_move_to_con(Con *con, Con *target, bool behind_focused, bool fi
+     return true;
+ }
+ 
+-/*
+- * Moves the given container to the given mark.
+- *
+- */
+-bool con_move_to_mark(Con *con, const char *mark) {
+-    Con *target = con_by_mark(mark);
+-    if (target == NULL) {
+-        DLOG("found no container with mark \"%s\"\n", mark);
+-        return false;
+-    }
+-
++bool con_move_to_target(Con *con, Con *target) {
+     /* For target containers in the scratchpad, we just send the window to the scratchpad. */
+     if (con_get_workspace(target) == workspace_get("__i3_scratch")) {
+         DLOG("target container is in the scratchpad, moving container to scratchpad.\n");
+@@ -1438,6 +1428,20 @@ bool con_move_to_mark(Con *con, const char *mark) {
+     return _con_move_to_con(con, target, false, true, false, false, true);
+ }
+ 
++/*
++ * Moves the given container to the given mark.
++ *
++ */
++bool con_move_to_mark(Con *con, const char *mark) {
++    Con *target = con_by_mark(mark);
++    if (target == NULL) {
++        DLOG("found no container with mark \"%s\"\n", mark);
++        return false;
++    }
++
++    return con_move_to_target(con, target);
++}
++
+ /*
+  * Moves the given container to the currently focused container on the given
+  * workspace.
+diff --git a/src/config_directives.c b/src/config_directives.c
+index a9e6322bf..1434ce316 100644
+--- a/src/config_directives.c
++++ b/src/config_directives.c
+@@ -318,6 +318,10 @@ CFGFUN(focus_follows_mouse, const char *value) {
+     config.disable_focus_follows_mouse = !boolstr(value);
+ }
+ 
++CFGFUN(tiling_drag, const char *value) {
++    config.disable_tiling_drag = !boolstr(value);
++}
++
+ CFGFUN(mouse_warping, const char *value) {
+     if (strcmp(value, "none") == 0)
+         config.mouse_warping = POINTER_WARPING_NONE;
+diff --git a/src/tiling_drag.c b/src/tiling_drag.c
+new file mode 100644
+index 000000000..ec51b7b18
+--- /dev/null
++++ b/src/tiling_drag.c
+@@ -0,0 +1,358 @@
++/*
++ * vim:ts=4:sw=4:expandtab
++ *
++ * i3 - an improved dynamic tiling window manager
++ * © 2009 Michael Stapelberg and contributors (see also: LICENSE)
++ *
++ * tiling_drag.c: Reposition tiled windows by dragging.
++ *
++ */
++#include "all.h"
++static xcb_window_t create_drop_indicator(Rect rect);
++
++/*
++ * Includes decoration (container title) to the container's rect. This way we
++ * can find the correct drop target if the mouse is on a container's
++ * decoration.
++ *
++ */
++static Rect con_rect_plus_deco_height(Con *con) {
++    Rect rect = con->rect;
++    rect.height += con->deco_rect.height;
++    rect.y -= con->deco_rect.height;
++    return rect;
++}
++
++/*
++ * Return an appropriate target at given coordinates.
++ *
++ */
++static Con *find_drop_target(uint32_t x, uint32_t y) {
++    Con *con;
++    TAILQ_FOREACH (con, &all_cons, all_cons) {
++        Rect rect = con_rect_plus_deco_height(con);
++
++        if (rect_contains(rect, x, y) &&
++            con_has_managed_window(con) &&
++            !con_is_floating(con) &&
++            !con_is_hidden(con)) {
++            Con *ws = con_get_workspace(con);
++            if (!workspace_is_visible(ws)) {
++                continue;
++            }
++            Con *fs = con_get_fullscreen_covering_ws(ws);
++            return fs ? fs : con;
++        }
++    }
++
++    /* Couldn't find leaf container, get a workspace. */
++    Output *output = get_output_containing(x, y);
++    if (!output) {
++        return NULL;
++    }
++    Con *content = output_get_content(output->con);
++    /* Still descend because you can drag to the bar on an non-empty workspace. */
++    return con_descend_tiling_focused(content);
++}
++
++typedef enum { DT_SIBLING,
++               DT_CENTER,
++               DT_PARENT
++} drop_type_t;
++
++struct callback_params {
++    xcb_window_t *indicator;
++    Con **target;
++    direction_t *direction;
++    drop_type_t *drop_type;
++};
++
++static Rect adjust_rect(Rect rect, direction_t direction, uint32_t threshold) {
++    switch (direction) {
++        case D_LEFT:
++            rect.width = threshold;
++            break;
++        case D_UP:
++            rect.height = threshold;
++            break;
++        case D_RIGHT:
++            rect.x += (rect.width - threshold);
++            rect.width = threshold;
++            break;
++        case D_DOWN:
++            rect.y += (rect.height - threshold);
++            rect.height = threshold;
++            break;
++    }
++    return rect;
++}
++
++static bool con_on_side_of_parent(Con *con, direction_t direction) {
++    const orientation_t orientation = orientation_from_direction(direction);
++    direction_t reverse_direction;
++    switch (direction) {
++        case D_LEFT:
++            reverse_direction = D_RIGHT;
++            break;
++        case D_RIGHT:
++            reverse_direction = D_LEFT;
++            break;
++        case D_UP:
++            reverse_direction = D_DOWN;
++            break;
++        case D_DOWN:
++            reverse_direction = D_UP;
++            break;
++    }
++    return (con_orientation(con->parent) != orientation ||
++            con->parent->layout == L_STACKED || con->parent->layout == L_TABBED ||
++            con_descend_direction(con->parent, reverse_direction) == con);
++}
++
++/*
++ * The callback that is executed on every mouse move while dragging. On each
++ * invocation we determin the drop target and the direction in which to insert
++ * the dragged container. The indicator window is updated to show the new
++ * position of the dragged container. The target container and direction are
++ * passed out using the callback params.
++ *
++ */
++DRAGGING_CB(drag_callback) {
++    /* 30% of the container (minus the parent indicator) is used to drop the
++     * dragged container as a sibling to the target */
++    const double sibling_indicator_percent_of_rect = 0.3;
++    /* Use the base decoration height and add a few pixels. This makes the
++     * outter indicator generally thin but at least thick enough to cover
++     * container titles */
++    const double parent_indicator_max_size = render_deco_height() + 5;
++
++    Con *target = find_drop_target(new_x, new_y);
++    if (target == NULL) {
++        return;
++    }
++
++    Rect rect = con_rect_plus_deco_height(target);
++
++    direction_t direction = 0;
++    drop_type_t drop_type = DT_CENTER;
++    bool draw_window = true;
++    const struct callback_params *params = extra;
++
++    if (target->type == CT_WORKSPACE) {
++        goto create_indicator;
++    }
++
++    /* Define the thresholds in pixels. The drop type depends on the cursor
++     * position. */
++    const uint32_t min_rect_dimension = min(rect.width, rect.height);
++    const uint32_t sibling_indicator_size = max(2, (uint32_t)(sibling_indicator_percent_of_rect * min_rect_dimension));
++    const uint32_t parent_indicator_size = min(
++        parent_indicator_max_size,
++        /* For small containers, start where the sibling indicator finishes.
++         * This is always at least 1 pixel. We use min() to not override the
++         * sibling indicator: */
++        sibling_indicator_size - 1);
++
++    /* Find which edge the cursor is closer to. */
++    const uint32_t d_left = new_x - rect.x;
++    const uint32_t d_top = new_y - rect.y;
++    const uint32_t d_right = rect.x + rect.width - new_x;
++    const uint32_t d_bottom = rect.y + rect.height - new_y;
++    const uint32_t d_min = min(min(d_left, d_right), min(d_top, d_bottom));
++    /* And move the container towards that direction. */
++    if (d_left == d_min) {
++        direction = D_LEFT;
++    } else if (d_top == d_min) {
++        direction = D_UP;
++    } else if (d_right == d_min) {
++        direction = D_RIGHT;
++    } else if (d_bottom == d_min) {
++        direction = D_DOWN;
++    } else {
++        /* Keep the compiler happy */
++        ELOG("min() is broken\n");
++        assert(false);
++    }
++    const bool target_parent = (d_min < parent_indicator_size &&
++                                con_on_side_of_parent(target, direction));
++    const bool target_sibling = (d_min < sibling_indicator_size);
++    drop_type = target_parent ? DT_PARENT : (target_sibling ? DT_SIBLING : DT_CENTER);
++
++    /* target == con makes sense only when we are moving away from target's parent. */
++    if (drop_type != DT_PARENT && target == con) {
++        draw_window = false;
++        xcb_destroy_window(conn, *(params->indicator));
++        *(params->indicator) = 0;
++        goto create_indicator;
++    }
++
++    switch (drop_type) {
++        case DT_PARENT:
++            while (target->parent->type != CT_WORKSPACE && con_on_side_of_parent(target->parent, direction)) {
++                target = target->parent;
++            }
++            rect = adjust_rect(target->parent->rect, direction, parent_indicator_size);
++            break;
++        case DT_CENTER:
++            rect = target->rect;
++            rect.x += sibling_indicator_size;
++            rect.y += sibling_indicator_size;
++            rect.width -= sibling_indicator_size * 2;
++            rect.height -= sibling_indicator_size * 2;
++            break;
++        case DT_SIBLING:
++            rect = adjust_rect(target->rect, direction, sibling_indicator_size);
++            break;
++    }
++
++create_indicator:
++    if (draw_window) {
++        if (*(params->indicator) == 0) {
++            *(params->indicator) = create_drop_indicator(rect);
++        } else {
++            const uint32_t values[4] = {rect.x, rect.y, rect.width, rect.height};
++            const uint32_t mask = XCB_CONFIG_WINDOW_X |
++                                  XCB_CONFIG_WINDOW_Y |
++                                  XCB_CONFIG_WINDOW_WIDTH |
++                                  XCB_CONFIG_WINDOW_HEIGHT;
++            xcb_configure_window(conn, *(params->indicator), mask, values);
++        }
++    }
++    x_mask_event_mask(~XCB_EVENT_MASK_ENTER_WINDOW);
++    xcb_flush(conn);
++
++    *(params->target) = target;
++    *(params->direction) = direction;
++    *(params->drop_type) = drop_type;
++}
++
++/*
++ * Returns a new drop indicator window with the given initial coordinates.
++ *
++ */
++static xcb_window_t create_drop_indicator(Rect rect) {
++    uint32_t mask = 0;
++    uint32_t values[2];
++
++    mask = XCB_CW_BACK_PIXEL;
++    values[0] = config.client.focused.indicator.colorpixel;
++
++    mask |= XCB_CW_OVERRIDE_REDIRECT;
++    values[1] = 1;
++
++    xcb_window_t indicator = create_window(conn, rect, XCB_COPY_FROM_PARENT, XCB_COPY_FROM_PARENT,
++                                           XCB_WINDOW_CLASS_INPUT_OUTPUT, XCURSOR_CURSOR_MOVE, false, mask, values);
++    /* Change the window class to "i3-drag", so that it can be matched in a
++     * compositor configuration. Note that the class needs to be changed before
++     * mapping the window. */
++    xcb_change_property(conn,
++                        XCB_PROP_MODE_REPLACE,
++                        indicator,
++                        XCB_ATOM_WM_CLASS,
++                        XCB_ATOM_STRING,
++                        8,
++                        (strlen("i3-drag") + 1) * 2,
++                        "i3-drag\0i3-drag\0");
++    xcb_map_window(conn, indicator);
++    xcb_circulate_window(conn, XCB_CIRCULATE_RAISE_LOWEST, indicator);
++
++    return indicator;
++}
++
++/*
++ * Initiates a mouse drag operation on a tiled window.
++ *
++ */
++void tiling_drag(Con *con, xcb_button_press_event_t *event) {
++    DLOG("Start dragging tiled container: con = %p\n", con);
++    bool set_focus = (con == focused);
++    bool set_fs = con->fullscreen_mode != CF_NONE;
++
++    /* Don't change focus while dragging. */
++    x_mask_event_mask(~XCB_EVENT_MASK_ENTER_WINDOW);
++    xcb_flush(conn);
++
++    /* Indicate drop location while dragging. This blocks until the drag is completed. */
++    Con *target = NULL;
++    direction_t direction;
++    drop_type_t drop_type;
++    xcb_window_t indicator = 0;
++    const struct callback_params params = {&indicator, &target, &direction, &drop_type};
++
++    drag_result_t drag_result = drag_pointer(con, event, XCB_NONE, BORDER_TOP, XCURSOR_CURSOR_MOVE, drag_callback, &params);
++
++    /* Dragging is done. We don't need the indicator window any more. */
++    xcb_destroy_window(conn, indicator);
++
++    if (drag_result == DRAG_REVERT ||
++        target == NULL ||
++        (target == con && drop_type != DT_PARENT) ||
++        !con_exists(target)) {
++        return;
++    }
++
++    const orientation_t orientation = orientation_from_direction(direction);
++    const position_t position = position_from_direction(direction);
++    const layout_t layout = orientation == VERT ? L_SPLITV : L_SPLITH;
++    con_disable_fullscreen(con);
++    switch (drop_type) {
++        case DT_CENTER:
++            /* Also handles workspaces.*/
++            con_move_to_target(con, target);
++            break;
++        case DT_SIBLING:
++            if (con_orientation(target->parent) != orientation) {
++                /* If con and target are the only children of the same parent, we can just change
++                 * the parent's layout manually and then move con to the correct position.
++                 * tree_split checks for a parent with only one child so it would create a new
++                 * parent with the new layout. */
++                if (con->parent == target->parent && con_num_children(target->parent) == 2) {
++                    target->parent->layout = layout;
++                } else {
++                    tree_split(target, orientation);
++                }
++            }
++
++            insert_con_into(con, target, position);
++
++            ipc_send_window_event("move", con);
++            break;
++        case DT_PARENT:
++            if (con != target) {
++                insert_con_into(con, target, position);
++            }
++            /* tree_move can change the focus */
++            Con *old_focus = focused;
++            tree_move(con, direction);
++            if (focused != old_focus) {
++                con_activate(old_focus);
++            }
++            break;
++    }
++
++    /* Manage fullscreen status. */
++    if (set_focus || set_fs) {
++        Con *fs = con_get_fullscreen_covering_ws(con_get_workspace(target));
++        if (fs == con) {
++            ELOG("dragged container somehow got fullscreen again.\n");
++            assert(false);
++        } else if (fs && set_focus && set_fs) {
++            /* con was focused & fullscreen, disable other fullscreen container. */
++            con_disable_fullscreen(fs);
++        } else if (fs) {
++            /* con was not focused, prefer other fullscreen container. */
++            set_fs = set_focus = false;
++        } else if (!set_focus) {
++            /* con was not focused. If it was fullscreen and we are moving it to the focused
++             * workspace we must focus it. */
++            set_focus = (set_fs && con_get_workspace(focused) == con_get_workspace(con));
++        }
++    }
++    if (set_fs) {
++        con_enable_fullscreen(con, CF_OUTPUT);
++    }
++    if (set_focus) {
++        con_focus(con);
++    }
++    tree_render();
++}
+diff --git a/src/workspace.c b/src/workspace.c
+index 739358a8a..d1c7d6cc4 100644
+--- a/src/workspace.c
++++ b/src/workspace.c
+@@ -305,10 +305,10 @@ Con *create_workspace_on_output(Output *output, Con *content) {
+  */
+ bool workspace_is_visible(Con *ws) {
+     Con *output = con_get_output(ws);
+-    if (output == NULL)
++    if (output == NULL) {
+         return false;
++    }
+     Con *fs = con_get_fullscreen_con(output, CF_OUTPUT);
+-    LOG("workspace visible? fs = %p, ws = %p\n", fs, ws);
+     return (fs == ws);
+ }
+ 
+diff --git a/testcases/t/201-config-parser.t b/testcases/t/201-config-parser.t
+index 3a21a8a04..98b8a9d1f 100644
+--- a/testcases/t/201-config-parser.t
++++ b/testcases/t/201-config-parser.t
+@@ -529,6 +529,7 @@ my $expected_all_tokens = "ERROR: CONFIG: Expected one of these tokens: <end>, '
+         assign
+         no_focus
+         focus_follows_mouse
++        tiling_drag
+         mouse_warping
+         focus_wrapping
+         force_focus_wrapping
+diff --git a/testcases/t/316-drag-container.t b/testcases/t/316-drag-container.t
+new file mode 100644
+index 000000000..3790ba134
+--- /dev/null
++++ b/testcases/t/316-drag-container.t
+@@ -0,0 +1,350 @@
++#!perl
++# vim:ts=4:sw=4:expandtab
++#
++# Please read the following documents before working on tests:
++# • https://build.i3wm.org/docs/testsuite.html
++#   (or docs/testsuite)
++#
++# • https://build.i3wm.org/docs/lib-i3test.html
++#   (alternatively: perldoc ./testcases/lib/i3test.pm)
++#
++# • https://build.i3wm.org/docs/ipc.html
++#   (or docs/ipc)
++#
++# • http://onyxneon.com/books/modern_perl/modern_perl_a4.pdf
++#   (unless you are already familiar with Perl)
++#
++# Test dragging containers.
++
++my ($width, $height) = (1000, 500);
++
++# use i3test i3_config => <<"EOT";
++my $config = <<"EOT";
++# i3 config file (v4)
++font -misc-fixed-medium-r-normal--13-120-75-75-C-70-iso10646-1
++
++focus_follows_mouse no
++floating_modifier Mod1
++
++# 2 side by side outputs
++fake-outputs ${width}x${height}+0+0P,${width}x${height}+${width}+0
++
++bar {
++    output primary
++}
++EOT
++use i3test i3_autostart => 0;
++use i3test::XTEST;
++my $pid = launch_with_config($config);
++
++sub start_drag {
++    my ($pos_x, $pos_y) = @_;
++    die "Drag outside of bounds!" unless $pos_x < $width * 2 && $pos_y < $height;
++
++    $x->root->warp_pointer($pos_x, $pos_y);
++    sync_with_i3;
++
++    xtest_key_press(64);        # Alt_L
++    xtest_button_press(1, $pos_x, $pos_y);
++    xtest_sync_with_i3;
++}
++
++sub end_drag {
++    my ($pos_x, $pos_y) = @_;
++    die "Drag outside of bounds!" unless $pos_x < $width * 2 && $pos_y < $height;
++
++    $x->root->warp_pointer($pos_x, $pos_y);
++    sync_with_i3;
++
++    xtest_button_release(1, $pos_x, $pos_y);
++    xtest_key_release(64);      # Alt_L
++    xtest_sync_with_i3;
++}
++
++my ($ws1, $ws2);
++my ($A, $B, $tmp);
++my ($A_id, $B_id);
++
++sub move_subtest {
++    my ($cb, $win) = @_;
++
++    my @events = events_for($cb, 'window');
++    my @move = grep { $_->{change} eq 'move' } @events;
++
++    is(scalar @move, 1, 'Received 1 window::move event');
++    is($move[0]->{container}->{window}, $A->{id}, "window id matches");
++}
++
++###############################################################################
++# Drag floating container onto an empty workspace.
++###############################################################################
++
++$ws2 = fresh_workspace(output => 1);
++$ws1 = fresh_workspace(output => 0);
++$A = open_floating_window(rect => [ 30, 30, 50, 50 ]);
++
++start_drag(40, 40);
++end_drag(1050, 50);
++
++is($x->input_focus, $A->id, 'Floating window moved to the right workspace');
++is($ws2, focused_ws, 'Empty workspace focused after floating window dragged to it');
++
++###############################################################################
++# Drag tiling container onto an empty workspace.
++###############################################################################
++
++subtest "Draging tiling container onto an empty workspace produces move event", \&move_subtest,
++sub {
++
++$ws2 = fresh_workspace(output => 1);
++$ws1 = fresh_workspace(output => 0);
++$A = open_window;
++
++start_drag(50, 50);
++end_drag(1050, 50);
++
++is($x->input_focus, $A->id, 'Tiling window moved to the right workspace');
++is($ws2, focused_ws, 'Empty workspace focused after tiling window dragged to it');
++
++};
++
++###############################################################################
++# Drag tiling container onto a container that closes before the drag is
++# complete.
++###############################################################################
++
++$ws1 = fresh_workspace(output => 0);
++$A = open_window;
++open_window;
++
++start_drag(600, 300);  # Start dragging the second window.
++
++# Try to place it on the first window.
++$x->root->warp_pointer(50, 50);
++sync_with_i3;
++
++cmd '[id=' . $A->id . '] kill';
++sync_with_i3;
++end_drag(50, 50);
++
++is(@{get_ws_content($ws1)}, 1, 'One container left in ws1');
++
++###############################################################################
++# Drag tiling container onto a tiling container on an other workspace.
++###############################################################################
++
++subtest "Draging tiling container onto a tiling container on an other workspace produces move event", \&move_subtest,
++sub {
++
++$ws2 = fresh_workspace(output => 1);
++open_window;
++$B_id = get_focused($ws2);
++$ws1 = fresh_workspace(output => 0);
++$A = open_window;
++$A_id = get_focused($ws1);
++
++start_drag(50, 50);
++end_drag(1500, 250);  # Center of right output, inner region.
++
++is($ws2, focused_ws, 'Workspace focused after tiling window dragged to it');
++$ws2 = get_ws($ws2);
++is($ws2->{focus}[0], $A_id, 'A focused first, dragged container kept focus');
++is($ws2->{focus}[1], $B_id, 'B focused second');
++
++};
++
++###############################################################################
++# Drag tiling container onto a floating container on an other workspace.
++###############################################################################
++
++subtest "Draging tiling container onto a floating container on an other workspace produces move event", \&move_subtest,
++sub {
++
++$ws2 = fresh_workspace(output => 1);
++open_floating_window;
++$B_id = get_focused($ws2);
++$ws1 = fresh_workspace(output => 0);
++$A = open_window;
++$A_id = get_focused($ws1);
++
++start_drag(50, 50);
++end_drag(1500, 250);
++
++is($ws2, focused_ws, 'Workspace with one floating container focused after tiling window dragged to it');
++$ws2 = get_ws($ws2);
++is($ws2->{focus}[0], $A_id, 'A focused first, dragged container kept focus');
++is($ws2->{floating_nodes}[0]->{nodes}[0]->{id}, $B_id, 'B exists & floating');
++
++};
++
++###############################################################################
++# Drag tiling container onto a bar.
++###############################################################################
++
++subtest "Draging tiling container onto a bar produces move event", \&move_subtest,
++sub {
++
++$ws1 = fresh_workspace(output => 0);
++open_window;
++$B_id = get_focused($ws1);
++$ws2 = fresh_workspace(output => 1);
++$A = open_window;
++$A_id = get_focused($ws2);
++
++start_drag(1500, 250);
++end_drag(1, 498);  # Bar on bottom of left output.
++
++is($ws1, focused_ws, 'Workspace focused after tiling window dragged to its bar');
++$ws1 = get_ws($ws1);
++is($ws1->{focus}[0], $A_id, 'B focused first, dragged container kept focus');
++is($ws1->{focus}[1], $B_id, 'A focused second');
++
++};
++
++###############################################################################
++# Drag an unfocused tiling container onto it's self.
++###############################################################################
++
++$ws1 = fresh_workspace(output => 0);
++open_window;
++$A_id = get_focused($ws1);
++open_window;
++$B_id = get_focused($ws1);
++
++start_drag(50, 50);
++end_drag(450, 450);
++
++$ws1 = get_ws($ws1);
++is($ws1->{focus}[0], $B_id, 'B focused first, kept focus');
++is($ws1->{focus}[1], $A_id, 'A focused second, unfocused dragged container didn\'t gain focus');
++
++###############################################################################
++# Drag an unfocused tiling container onto an occupied workspace.
++###############################################################################
++
++subtest "Draging unfocused tiling container onto an occupied workspace produces move event", \&move_subtest,
++sub {
++
++$ws1 = fresh_workspace(output => 0);
++$A = open_window;
++$A_id = get_focused($ws1);
++$ws2 = fresh_workspace(output => 1);
++open_window;
++$B_id = get_focused($ws2);
++
++start_drag(50, 50);
++end_drag(1500, 250);  # Center of right output, inner region.
++
++is($ws2, focused_ws, 'Workspace remained focused after dragging unfocused container');
++$ws2 = get_ws($ws2);
++is($ws2->{focus}[0], $B_id, 'B focused first, kept focus');
++is($ws2->{focus}[1], $A_id, 'A focused second, unfocused container didn\'t steal focus');
++
++};
++
++###############################################################################
++# Drag fullscreen container onto window in same workspace.
++###############################################################################
++
++$ws1 = fresh_workspace(output => 0);
++open_window;
++$A = open_window;
++cmd 'fullscreen enable';
++
++start_drag(900, 100);  # Second window
++end_drag(50, 50);  # To first window
++
++is($ws1, focused_ws, 'Workspace remained focused after dragging fullscreen container');
++is_num_fullscreen($ws1, 1, 'Container still fullscreened');
++is($x->input_focus, $A->id, 'Fullscreen container still focused');
++
++###############################################################################
++# Drag unfocused fullscreen container onto window in other workspace.
++###############################################################################
++
++subtest "Draging unfocused fullscreen container onto window in other workspace produces move event", \&move_subtest,
++sub {
++
++$ws1 = fresh_workspace(output => 0);
++$A = open_window;
++cmd 'fullscreen enable';
++$ws2 = fresh_workspace(output => 1);
++open_window;
++open_window;
++
++start_drag(900, 100);
++end_drag(1000 + 500 * 0.15 + 10, 200);  # left of leftmost window
++
++is($ws2, focused_ws, 'Workspace still focused after dragging fullscreen container to it');
++is_num_fullscreen($ws1, 0, 'No fullscreen container in first workspace');
++is_num_fullscreen($ws2, 1, 'Moved container still fullscreened');
++is($x->input_focus, $A->id, 'Fullscreen container now focused');
++$ws2 = get_ws($ws2);
++is($ws2->{nodes}->[0]->{window}, $A->id, 'Fullscreen container now leftmost window in second workspace');
++
++};
++
++###############################################################################
++# Drag unfocused fullscreen container onto left outter region of window in
++# other workspace. The container shouldn't end up in $ws2 because it was
++# dragged onto the outter region of the leftmost window. We must also check
++# that the focus remains on the other window.
++###############################################################################
++
++subtest "Draging unfocused fullscreen container onto left outter region of window in other workspace produces move event", \&move_subtest,
++sub {
++
++$ws1 = fresh_workspace(output => 0);
++open_window for (1..3);
++$A = open_window;
++$tmp = get_focused($ws1);
++cmd 'fullscreen enable';
++$ws2 = fresh_workspace(output => 1);
++$B = open_window;
++
++start_drag(990, 100);  # rightmost of $ws1
++end_drag(1004, 100);  # outter region of window of $ws2
++
++is($ws2, focused_ws, 'Workspace still focused after dragging fullscreen container to it');
++is_num_fullscreen($ws1, 1, 'Fullscreen container still in first workspace');
++is_num_fullscreen($ws2, 0, 'No fullscreen container in second workspace');
++is($x->input_focus, $B->id, 'Window of second workspace still has focus');
++is(get_focused($ws1), $tmp, 'Fullscreen container still focused in first workspace');
++$ws1 = get_ws($ws1);
++is($ws1->{nodes}->[3]->{window}, $A->id, 'Fullscreen container still rightmost window in first workspace');
++
++};
++
++###############################################################################
++# Disable tiling drag through the config option.
++###############################################################################
++
++exit_gracefully($pid);
++
++$config = <<"EOT";
++# i3 config file (v4)
++font -misc-fixed-medium-r-normal--13-120-75-75-C-70-iso10646-1
++
++focus_follows_mouse no
++tiling_drag no
++floating_modifier Mod1
++
++fake-outputs ${width}x${height}+0+0,${width}x${height}+${width}+0
++EOT
++$pid = launch_with_config($config);
++
++$ws2 = fresh_workspace(output => 1);
++$ws1 = fresh_workspace(output => 0);
++open_window;
++$A = get_focused($ws1);
++
++start_drag(50, 50);
++end_drag(1050, 50);
++
++is(get_focused($ws1), $A, 'Tiling window still in first workspace after tiling drag disabled');
++
++exit_gracefully($pid);
++
++###############################################################################
++
++done_testing;
+
+From 4595b34b83c51ca40f98c0b02268cbb39b73164b Mon Sep 17 00:00:00 2001
+From: Orestis Floros <orestisflo@gmail.com>
+Date: Tue, 9 Nov 2021 21:50:37 +0100
+Subject: [PATCH 2/5] squash! Allow dragging tiled windows with the mouse.
+
+Remove config
+---
+ docs/userguide                   |  5 -----
+ include/config_directives.h      |  1 -
+ include/configuration.h          |  6 ------
+ parser-specs/config.spec         |  6 ------
+ src/click.c                      |  4 ++--
+ src/config_directives.c          |  4 ----
+ testcases/t/201-config-parser.t  |  1 -
+ testcases/t/316-drag-container.t | 28 ----------------------------
+ 8 files changed, 2 insertions(+), 53 deletions(-)
+
+diff --git a/docs/userguide b/docs/userguide
+index 396be2c70..8003dbb2a 100644
+--- a/docs/userguide
++++ b/docs/userguide
+@@ -237,11 +237,6 @@ Drop to parent::
+ 
+ The color of the indicator matches the +client.focused+ setting. See <<client_colors>>.
+ 
+-The whole behaviour can be disabled in the config file by using:
+-----------------------
+-tiling_drag no
+-----------------------
+-
+ [[tree]]
+ == Tree
+ 
+diff --git a/include/config_directives.h b/include/config_directives.h
+index dd1c0c53c..e00570979 100644
+--- a/include/config_directives.h
++++ b/include/config_directives.h
+@@ -49,7 +49,6 @@ CFGFUN(default_orientation, const char *orientation);
+ CFGFUN(workspace_layout, const char *layout);
+ CFGFUN(workspace_back_and_forth, const char *value);
+ CFGFUN(focus_follows_mouse, const char *value);
+-CFGFUN(tiling_drag, const char *value);
+ CFGFUN(mouse_warping, const char *value);
+ CFGFUN(focus_wrapping, const char *value);
+ CFGFUN(force_focus_wrapping, const char *value);
+diff --git a/include/configuration.h b/include/configuration.h
+index 33c05cbe1..843e156f9 100644
+--- a/include/configuration.h
++++ b/include/configuration.h
+@@ -124,12 +124,6 @@ struct Config {
+      * It is not planned to add any different focus models. */
+     bool disable_focus_follows_mouse;
+ 
+-    /** By default, the user can use the floating modifier key and the left
+-     * mouse button to move tiling containers. The user can turn this
+-     * functionality off.
+-     */
+-    bool disable_tiling_drag;
+-
+     /** By default, when switching focus to a window on a different output
+      * (e.g. focusing a window on workspace 3 on output VGA-1, coming from
+      * workspace 2 on LVDS-1), the mouse cursor is warped to the center of
+diff --git a/parser-specs/config.spec b/parser-specs/config.spec
+index 23040c5fe..b62491ed3 100644
+--- a/parser-specs/config.spec
++++ b/parser-specs/config.spec
+@@ -37,7 +37,6 @@ state INITIAL:
+   'assign'                                 -> ASSIGN
+   'no_focus'                               -> NO_FOCUS
+   'focus_follows_mouse'                    -> FOCUS_FOLLOWS_MOUSE
+-  'tiling_drag'                            -> TILING_DRAG
+   'mouse_warping'                          -> MOUSE_WARPING
+   'focus_wrapping'                         -> FOCUS_WRAPPING
+   'force_focus_wrapping'                   -> FORCE_FOCUS_WRAPPING
+@@ -234,11 +233,6 @@ state FOCUS_FOLLOWS_MOUSE:
+   value = word
+       -> call cfg_focus_follows_mouse($value)
+ 
+-# tiling_drag bool
+-state TILING_DRAG:
+-  value = word
+-      -> call cfg_tiling_drag($value)
+-
+ # mouse_warping warping_t
+ state MOUSE_WARPING:
+   value = 'none', 'output'
+diff --git a/src/click.c b/src/click.c
+index 60b87e473..3b68ab8e8 100644
+--- a/src/click.c
++++ b/src/click.c
+@@ -216,7 +216,7 @@ static void route_click(Con *con, xcb_button_press_event_t *event, const bool mo
+     }
+ 
+     /* 2: floating modifier pressed, initiate a drag */
+-    if (!config.disable_tiling_drag && mod_pressed && event->detail == XCB_BUTTON_INDEX_1 && !floatingcon) {
++    if (mod_pressed && event->detail == XCB_BUTTON_INDEX_1 && !floatingcon) {
+         tiling_drag(con, event);
+         goto done;
+     }
+@@ -289,7 +289,7 @@ static void route_click(Con *con, xcb_button_press_event_t *event, const bool mo
+     }
+ 
+     /* 8: floating modifier pressed, initiate a drag */
+-    if (!config.disable_tiling_drag && (mod_pressed || dest == CLICK_DECORATION) && event->detail == XCB_BUTTON_INDEX_1) {
++    if ((mod_pressed || dest == CLICK_DECORATION) && event->detail == XCB_BUTTON_INDEX_1) {
+         tiling_drag(con, event);
+         goto done;
+     }
+diff --git a/src/config_directives.c b/src/config_directives.c
+index 1434ce316..a9e6322bf 100644
+--- a/src/config_directives.c
++++ b/src/config_directives.c
+@@ -318,10 +318,6 @@ CFGFUN(focus_follows_mouse, const char *value) {
+     config.disable_focus_follows_mouse = !boolstr(value);
+ }
+ 
+-CFGFUN(tiling_drag, const char *value) {
+-    config.disable_tiling_drag = !boolstr(value);
+-}
+-
+ CFGFUN(mouse_warping, const char *value) {
+     if (strcmp(value, "none") == 0)
+         config.mouse_warping = POINTER_WARPING_NONE;
+diff --git a/testcases/t/201-config-parser.t b/testcases/t/201-config-parser.t
+index 98b8a9d1f..3a21a8a04 100644
+--- a/testcases/t/201-config-parser.t
++++ b/testcases/t/201-config-parser.t
+@@ -529,7 +529,6 @@ my $expected_all_tokens = "ERROR: CONFIG: Expected one of these tokens: <end>, '
+         assign
+         no_focus
+         focus_follows_mouse
+-        tiling_drag
+         mouse_warping
+         focus_wrapping
+         force_focus_wrapping
+diff --git a/testcases/t/316-drag-container.t b/testcases/t/316-drag-container.t
+index 3790ba134..ed2c25048 100644
+--- a/testcases/t/316-drag-container.t
++++ b/testcases/t/316-drag-container.t
+@@ -315,34 +315,6 @@ is($ws1->{nodes}->[3]->{window}, $A->id, 'Fullscreen container still rightmost w
+ 
+ };
+ 
+-###############################################################################
+-# Disable tiling drag through the config option.
+-###############################################################################
+-
+-exit_gracefully($pid);
+-
+-$config = <<"EOT";
+-# i3 config file (v4)
+-font -misc-fixed-medium-r-normal--13-120-75-75-C-70-iso10646-1
+-
+-focus_follows_mouse no
+-tiling_drag no
+-floating_modifier Mod1
+-
+-fake-outputs ${width}x${height}+0+0,${width}x${height}+${width}+0
+-EOT
+-$pid = launch_with_config($config);
+-
+-$ws2 = fresh_workspace(output => 1);
+-$ws1 = fresh_workspace(output => 0);
+-open_window;
+-$A = get_focused($ws1);
+-
+-start_drag(50, 50);
+-end_drag(1050, 50);
+-
+-is(get_focused($ws1), $A, 'Tiling window still in first workspace after tiling drag disabled');
+-
+ exit_gracefully($pid);
+ 
+ ###############################################################################
+
+From ba68ff1a9f10d7287286a5ca01edac58121bef34 Mon Sep 17 00:00:00 2001
+From: Orestis Floros <orestisflo@gmail.com>
+Date: Wed, 10 Nov 2021 23:07:36 +0100
+Subject: [PATCH 3/5] Deal with tabbed/stacked DT_PARENT better
+
+---
+ src/tiling_drag.c | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/src/tiling_drag.c b/src/tiling_drag.c
+index ec51b7b18..f7e307b51 100644
+--- a/src/tiling_drag.c
++++ b/src/tiling_drag.c
+@@ -317,7 +317,18 @@ void tiling_drag(Con *con, xcb_button_press_event_t *event) {
+ 
+             ipc_send_window_event("move", con);
+             break;
+-        case DT_PARENT:
++        case DT_PARENT:;
++            const bool parent_tabbed_or_stacked = (target->parent->layout == L_TABBED || target->parent->layout == L_STACKED);
++            if (parent_tabbed_or_stacked) {
++                /* When dealing with tabbed/stacked the target can be in the
++                 * middle of the container. Thus, after a directional move, con
++                 * will still be bound to the tabbed/stacked parent. */
++                if (position == BEFORE) {
++                    target = TAILQ_FIRST(&(target->parent->nodes_head));
++                } else {
++                    target = TAILQ_LAST(&(target->parent->nodes_head), nodes_head);
++                }
++            }
+             if (con != target) {
+                 insert_con_into(con, target, position);
+             }
+
+From f2f6362eb9e1863913affdcf3d9d11598f6a9650 Mon Sep 17 00:00:00 2001
+From: Orestis Floros <orestisflo@gmail.com>
+Date: Mon, 6 Dec 2021 21:56:46 +0100
+Subject: [PATCH 4/5] Improve logging
+
+---
+ include/util.h    | 12 ++++++++++++
+ src/tiling_drag.c |  8 ++++++++
+ src/util.c        | 32 ++++++++++++++++++++++++++++++++
+ 3 files changed, 52 insertions(+)
+
+diff --git a/include/util.h b/include/util.h
+index 09ad941f5..8525b6d9a 100644
+--- a/include/util.h
++++ b/include/util.h
+@@ -183,3 +183,15 @@ position_t position_from_direction(direction_t direction);
+  *
+  */
+ direction_t direction_from_orientation_position(orientation_t orientation, position_t position);
++
++/**
++ * Converts direction to a string representation.
++ *
++ */
++const char *direction_to_string(direction_t direction);
++
++/**
++ * Converts position to a string representation.
++ *
++ */
++const char *position_to_string(position_t position);
+diff --git a/src/tiling_drag.c b/src/tiling_drag.c
+index f7e307b51..6f90e6292 100644
+--- a/src/tiling_drag.c
++++ b/src/tiling_drag.c
+@@ -288,6 +288,7 @@ void tiling_drag(Con *con, xcb_button_press_event_t *event) {
+         target == NULL ||
+         (target == con && drop_type != DT_PARENT) ||
+         !con_exists(target)) {
++        DLOG("drop aborted\n");
+         return;
+     }
+ 
+@@ -298,9 +299,11 @@ void tiling_drag(Con *con, xcb_button_press_event_t *event) {
+     switch (drop_type) {
+         case DT_CENTER:
+             /* Also handles workspaces.*/
++            DLOG("drop to center of %p\n", target);
+             con_move_to_target(con, target);
+             break;
+         case DT_SIBLING:
++            DLOG("drop %s %p\n", position_to_string(position), target);
+             if (con_orientation(target->parent) != orientation) {
+                 /* If con and target are the only children of the same parent, we can just change
+                  * the parent's layout manually and then move con to the correct position.
+@@ -319,6 +322,11 @@ void tiling_drag(Con *con, xcb_button_press_event_t *event) {
+             break;
+         case DT_PARENT:;
+             const bool parent_tabbed_or_stacked = (target->parent->layout == L_TABBED || target->parent->layout == L_STACKED);
++            DLOG("drop %s (%s) of %s%p\n",
++                 direction_to_string(direction),
++                 position_to_string(position),
++                 parent_tabbed_or_stacked ? "tabbed/stacked " : "",
++                 target);
+             if (parent_tabbed_or_stacked) {
+                 /* When dealing with tabbed/stacked the target can be in the
+                  * middle of the container. Thus, after a directional move, con
+diff --git a/src/util.c b/src/util.c
+index f2c562228..7b1486141 100644
+--- a/src/util.c
++++ b/src/util.c
+@@ -476,3 +476,35 @@ direction_t direction_from_orientation_position(orientation_t orientation, posit
+         return position == BEFORE ? D_UP : D_DOWN;
+     }
+ }
++
++/*
++ * Converts direction to a string representation.
++ *
++ */
++const char *direction_to_string(direction_t direction) {
++    switch (direction) {
++        case D_LEFT:
++            return "left";
++        case D_RIGHT:
++            return "right";
++        case D_UP:
++            return "up";
++        case D_DOWN:
++            return "down";
++    }
++    return "invalid";
++}
++
++/*
++ * Converts position to a string representation.
++ *
++ */
++const char *position_to_string(position_t position) {
++    switch (position) {
++        case BEFORE:
++            return "before";
++        case AFTER:
++            return "after";
++    }
++    return "invalid";
++}
+
+From ec693d0d776e385509453456c49e404017d9d9c9 Mon Sep 17 00:00:00 2001
+From: Orestis Floros <orestisflo@gmail.com>
+Date: Mon, 6 Dec 2021 21:56:57 +0100
+Subject: [PATCH 5/5] Fix crash
+
+---
+ src/tiling_drag.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/tiling_drag.c b/src/tiling_drag.c
+index 6f90e6292..d95c4f3b8 100644
+--- a/src/tiling_drag.c
++++ b/src/tiling_drag.c
+@@ -348,10 +348,12 @@ void tiling_drag(Con *con, xcb_button_press_event_t *event) {
+             }
+             break;
+     }
++    /* Warning: target might not exist anymore */
++    target = NULL;
+ 
+     /* Manage fullscreen status. */
+     if (set_focus || set_fs) {
+-        Con *fs = con_get_fullscreen_covering_ws(con_get_workspace(target));
++        Con *fs = con_get_fullscreen_covering_ws(con_get_workspace(con));
+         if (fs == con) {
+             ELOG("dragged container somehow got fullscreen again.\n");
+             assert(false);
